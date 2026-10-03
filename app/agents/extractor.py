@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 class InvoiceItem(BaseModel):
     line_no: int
     item_name: str
+    description: str | None = None
     unit: str
     quantity: Decimal
     unit_price: Decimal
@@ -45,6 +46,13 @@ Rules:
 - If supplier_id is not present, return null.
 - If PO number is not present, return null.
 - Return the result using the required structured schema.
+
+For each invoice line:
+
+- item_name: Extract the short product/item name.
+- description: Extract the detailed product description separately.
+- Do not combine the description with item_name.
+- If the document does not clearly provide a separate description, use null.
 
 Invoice document:
 
