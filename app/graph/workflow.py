@@ -2,10 +2,12 @@ from langgraph.graph import StateGraph, START, END
 
 from app.state import InvoiceState
 from app.agents.extractor import extract_invoice
+from app.agents.extractor import ExtractedInvoice
 from app.services.validation import validate_invoice
 from app.services.retrieval import get_po_context
 from app.services.matching import match_invoice
 from app.services.duplicate import check_exact_duplicate
+from app.tools.database import find_supplier_by_name
 
 
 def extract_node(state: InvoiceState):
@@ -17,11 +19,9 @@ def extract_node(state: InvoiceState):
 
 
 def validation_node(state: InvoiceState):
-    invoice_data = state["extracted_invoice"]
-
-    from app.agents.extractor import ExtractedInvoice
-
-    invoice = ExtractedInvoice.model_validate(invoice_data)
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
+    )
 
     result = validate_invoice(invoice)
 
@@ -40,11 +40,39 @@ def validation_router(state: InvoiceState):
 def supplier_node(state: InvoiceState):
     invoice = state["extracted_invoice"]
 
-    supplier_id = invoice.get("supplier_id")
+    supplier_name = invoice.get("supplier_name")
+
+    if not supplier_name:
+        return {
+            "supplier_id": None,
+            "error": "Invoice does not contain a supplier name",
+        }
+
+    supplier = find_supplier_by_name(supplier_name)
+
+    if not supplier:
+        return {
+            "supplier_id": None,
+            "error": f"Supplier not found: {supplier_name}",
+        }
+
+    if supplier.get("ambiguous"):
+        return {
+            "supplier_id": None,
+            "error": f"Multiple suppliers found for: {supplier_name}",
+        }
 
     return {
-        "supplier_id": supplier_id
+        "supplier_id": supplier["supplier_id"],
+        "error": None,
     }
+
+
+def supplier_router(state: InvoiceState):
+    if state.get("supplier_id") is None:
+        return "missing"
+
+    return "found"
 
 
 def duplicate_node(state: InvoiceState):
@@ -74,9 +102,11 @@ def po_retrieval_node(state: InvoiceState):
 
     if not po_id:
         return {
-            "error": "Invoice does not contain a PO number",
+            "po_id": None,
+            "po_context": None,
             "purchase_order": None,
             "goods_receipts": [],
+            "error": "Invoice does not contain a PO number",
         }
 
     context = get_po_context(po_id)
@@ -84,37 +114,36 @@ def po_retrieval_node(state: InvoiceState):
     if not context:
         return {
             "po_id": po_id,
+            "po_context": None,
             "purchase_order": None,
             "goods_receipts": [],
-            "error": "Purchase order not found",
+            "error": f"Purchase order not found: {po_id}",
         }
 
     return {
         "po_id": po_id,
+        "po_context": context,
         "purchase_order": context["purchase_order"],
         "goods_receipts": context["goods_receipts"],
+        "error": None,
     }
 
 
 def po_router(state: InvoiceState):
-    if state.get("purchase_order") is None:
+    if state.get("po_context") is None:
         return "missing"
 
     return "found"
 
 
 def matching_node(state: InvoiceState):
-    from app.agents.extractor import ExtractedInvoice
-
     invoice = ExtractedInvoice.model_validate(
         state["extracted_invoice"]
     )
 
-    po_context = get_po_context(state["po_id"])
-
     result = match_invoice(
         invoice,
-        po_context,
+        state["po_context"],
     )
 
     return {
@@ -130,21 +159,23 @@ def matching_router(state: InvoiceState):
 
 
 def exception_node(state: InvoiceState):
+    reason = (
+        state.get("error")
+        or state.get("matching_result", {}).get("exceptions")
+        or state.get("duplicate_result", {}).get("reason")
+        or state.get("validation_result", {}).get("errors")
+    )
+
     return {
         "exception_result": {
             "status": "open",
-            "reason": (
-                state.get("error")
-                or state.get("matching_result", {}).get("exceptions")
-                or state.get("duplicate_result", {}).get("reason")
-                or state.get("validation_result", {}).get("errors")
-            ),
+            "reason": reason,
         },
         "final_status": "exception",
     }
 
 
-def approved_node(state: InvoiceState):
+def matched_node(state: InvoiceState):
     return {
         "final_status": "matched"
     }
@@ -159,9 +190,10 @@ builder.add_node("duplicate", duplicate_node)
 builder.add_node("po_retrieval", po_retrieval_node)
 builder.add_node("matching", matching_node)
 builder.add_node("exception", exception_node)
-builder.add_node("approved", approved_node)
+builder.add_node("matched", matched_node)
 
 builder.add_edge(START, "extract")
+
 builder.add_edge("extract", "validation")
 
 builder.add_conditional_edges(
@@ -173,14 +205,21 @@ builder.add_conditional_edges(
     },
 )
 
-builder.add_edge("supplier", "duplicate")
+builder.add_conditional_edges(
+    "supplier",
+    supplier_router,
+    {
+        "found": "duplicate",
+        "missing": "exception",
+    },
+)
 
 builder.add_conditional_edges(
     "duplicate",
     duplicate_router,
     {
-        "duplicate": "exception",
         "new": "po_retrieval",
+        "duplicate": "exception",
     },
 )
 
@@ -188,8 +227,8 @@ builder.add_conditional_edges(
     "po_retrieval",
     po_router,
     {
-        "missing": "exception",
         "found": "matching",
+        "missing": "exception",
     },
 )
 
@@ -197,12 +236,12 @@ builder.add_conditional_edges(
     "matching",
     matching_router,
     {
-        "matched": "approved",
+        "matched": "matched",
         "exception": "exception",
     },
 )
 
+builder.add_edge("matched", END)
 builder.add_edge("exception", END)
-builder.add_edge("approved", END)
 
 graph = builder.compile()

@@ -13,6 +13,8 @@ class InvoiceState(TypedDict, total=False):
     duplicate_result: dict
 
     po_id: str | None
+    po_context: dict | None
+
     purchase_order: dict | None
     goods_receipts: list[dict]
 

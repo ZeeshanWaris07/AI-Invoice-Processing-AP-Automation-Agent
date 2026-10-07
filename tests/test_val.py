@@ -12,3 +12,9 @@ result = validate_invoice(invoice)
 
 print("\nVALIDATION RESULT")
 print(result)
+
+from app.tools.database import find_supplier_by_name
+
+supplier = find_supplier_by_name("Apex Industrial Supplies")
+
+print(supplier)

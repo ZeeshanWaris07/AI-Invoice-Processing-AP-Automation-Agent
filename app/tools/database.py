@@ -175,3 +175,39 @@ def find_similar_invoices(
         }
         for row in rows
     ]
+
+def find_supplier_by_name(supplier_name: str):
+    query = """
+        SELECT supplier_id, supplier_name, approved
+        FROM suppliers
+        WHERE LOWER(TRIM(supplier_name)) = LOWER(TRIM(%s))
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (supplier_name,))
+            rows = cur.fetchall()
+
+    if len(rows) == 0:
+        return None
+
+    if len(rows) > 1:
+        return {
+            "ambiguous": True,
+            "suppliers": [
+                {
+                    "supplier_id": row[0],
+                    "supplier_name": row[1],
+                    "approved": row[2],
+                }
+                for row in rows
+            ],
+        }
+
+    row = rows[0]
+
+    return {
+        "supplier_id": row[0],
+        "supplier_name": row[1],
+        "approved": row[2],
+    }
