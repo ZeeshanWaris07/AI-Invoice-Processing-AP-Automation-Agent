@@ -7,14 +7,18 @@ class InvoiceState(TypedDict, total=False):
 
     extracted_invoice: dict
 
+    supplier_id: str | None
+
     validation_result: dict
-    risk_result: dict
+    duplicate_result: dict
 
     po_id: str | None
     purchase_order: dict | None
     goods_receipts: list[dict]
 
     matching_result: dict
+
+    risk_result: dict
 
     exception_result: dict
 
