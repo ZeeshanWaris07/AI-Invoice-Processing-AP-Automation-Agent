@@ -1,9 +1,62 @@
 from app.tools.database import (
     find_similar_invoices,
+    get_connection,
 )
 
 
-def check_possible_duplicate(invoice, supplier_id: str):
+def check_exact_duplicate(
+    supplier_id: str,
+    invoice_number: str,
+):
+    query = """
+        SELECT
+            invoice_id,
+            supplier_id,
+            invoice_number,
+            status
+        FROM invoices
+        WHERE supplier_id = %s
+          AND invoice_number = %s
+        LIMIT 1
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                query,
+                (
+                    supplier_id,
+                    invoice_number,
+                ),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        return {
+            "is_duplicate": False,
+            "duplicate_type": None,
+            "existing_invoice_id": None,
+            "reason": None,
+        }
+
+    return {
+        "is_duplicate": True,
+        "duplicate_type": "exact_invoice_number",
+        "existing_invoice_id": row[0],
+        "existing_supplier_id": row[1],
+        "invoice_number": row[2],
+        "existing_status": row[3],
+        "reason": (
+            f"Supplier {supplier_id} already has invoice "
+            f"{invoice_number}."
+        ),
+    }
+
+
+def check_possible_duplicate(
+    invoice,
+    supplier_id: str,
+):
     candidates = find_similar_invoices(
         supplier_id=supplier_id,
         po_id=invoice.po_number,
