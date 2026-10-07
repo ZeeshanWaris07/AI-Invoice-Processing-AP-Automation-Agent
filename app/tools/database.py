@@ -125,3 +125,53 @@ def get_goods_receipts(po_id: str):
         }
         for row in rows
     ]
+
+
+def find_similar_invoices(
+    supplier_id: str,
+    po_id: str | None,
+    total_amount,
+    invoice_date,
+):
+    query = """
+        SELECT
+            invoice_id,
+            supplier_id,
+            po_id,
+            invoice_number,
+            invoice_date,
+            total_amount,
+            status
+        FROM invoices
+        WHERE supplier_id = %s
+          AND total_amount = %s
+          AND invoice_date BETWEEN %s - INTERVAL '7 days'
+                               AND %s + INTERVAL '7 days'
+        ORDER BY invoice_date
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                query,
+                (
+                    supplier_id,
+                    total_amount,
+                    invoice_date,
+                    invoice_date,
+                ),
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "invoice_id": row[0],
+            "supplier_id": row[1],
+            "po_id": row[2],
+            "invoice_number": row[3],
+            "invoice_date": row[4],
+            "total_amount": row[5],
+            "status": row[6],
+        }
+        for row in rows
+    ]
