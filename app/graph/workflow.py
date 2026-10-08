@@ -10,6 +10,7 @@ from app.services.duplicate import (
     check_possible_duplicate,
 )
 from app.tools.database import find_supplier_by_name, save_processed_invoice
+from app.services.risk import assess_invoice_risk
 
 def extract_node(state: InvoiceState):
     invoice = extract_invoice(state["invoice_path"])
@@ -236,7 +237,7 @@ def exception_node(state: InvoiceState):
     }
 
 
-def matched_node(state: InvoiceState):
+def persist_node(state: InvoiceState):
     invoice = ExtractedInvoice.model_validate(
         state["extracted_invoice"]
     )
@@ -254,6 +255,39 @@ def matched_node(state: InvoiceState):
         "final_status": "matched",
     }
 
+def risk_node(state: InvoiceState):
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
+    )
+
+    result = assess_invoice_risk(
+        invoice=invoice,
+        supplier_id=state["supplier_id"],
+        po_context=state["po_context"],
+    )
+
+    return {
+        "risk_result": result
+    }
+
+
+def risk_router(state: InvoiceState):
+    if state["risk_result"]["requires_review"]:
+        return "review"
+
+    return "clear"
+
+
+def risk_review_node(state: InvoiceState):
+    return {
+        "exception_result": {
+            "status": "open",
+            "reason": "Invoice requires risk review before processing.",
+            "risk_result": state["risk_result"],
+        },
+        "final_status": "risk_review",
+    }
+
 builder = StateGraph(InvoiceState)
 
 builder.add_node("extract", extract_node)
@@ -264,7 +298,9 @@ builder.add_node("duplicate_review", duplicate_review_node)
 builder.add_node("po_retrieval", po_retrieval_node)
 builder.add_node("matching", matching_node)
 builder.add_node("exception", exception_node)
-builder.add_node("matched", matched_node)
+builder.add_node("risk", risk_node)
+builder.add_node("risk_review", risk_review_node)
+builder.add_node("persist", persist_node)
 
 builder.add_edge(START, "extract")
 
@@ -311,10 +347,22 @@ builder.add_conditional_edges(
     "matching",
     matching_router,
     {
-        "matched": "matched",
+        "matched": "risk",
         "exception": "exception",
     },
 )
+
+builder.add_conditional_edges(
+    "risk",
+    risk_router,
+    {
+        "clear": "persist",
+        "review": "risk_review",
+    },
+)
+
+builder.add_edge("risk_review", END)
+builder.add_edge("persist", END)
 
 builder.add_edge("duplicate_review", END)
 builder.add_edge("matched", END)
