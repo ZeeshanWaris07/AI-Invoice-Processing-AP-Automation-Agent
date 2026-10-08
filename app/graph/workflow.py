@@ -1,5 +1,12 @@
-from langgraph.graph import StateGraph, START, END
+import uuid
 
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+
+from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+
+from app.config import DATABASE_URL
 from app.state import InvoiceState
 from app.agents.extractor import extract_invoice, ExtractedInvoice
 from app.services.validation import validate_invoice
@@ -9,14 +16,28 @@ from app.services.duplicate import (
     check_exact_duplicate,
     check_possible_duplicate,
 )
-from app.tools.database import find_supplier_by_name, save_processed_invoice
 from app.services.risk import assess_invoice_risk
+from app.services.approval import determine_approval
+from app.tools.database import (
+    find_supplier_by_name,
+    get_or_create_pending_approval,
+    update_invoice_approval,
+    save_processed_invoice,
+)
+
 
 def extract_node(state: InvoiceState):
     invoice = extract_invoice(state["invoice_path"])
 
+    invoice_id = state.get("invoice_id")
+
+    if not invoice_id:
+        invoice_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
+
     return {
-        "extracted_invoice": invoice.model_dump()
+        "invoice_id": invoice_id,
+        "extracted_invoice": invoice.model_dump(),
+        "error": None,
     }
 
 
@@ -218,43 +239,6 @@ def matching_router(state: InvoiceState):
     return "exception"
 
 
-def exception_node(state: InvoiceState):
-    reason = (
-        state.get("error")
-        or state.get("matching_result", {}).get("exceptions")
-        or state.get("duplicate_result", {})
-        .get("exact", {})
-        .get("reason")
-        or state.get("validation_result", {}).get("errors")
-    )
-
-    return {
-        "exception_result": {
-            "status": "open",
-            "reason": reason,
-        },
-        "final_status": "exception",
-    }
-
-
-def persist_node(state: InvoiceState):
-    invoice = ExtractedInvoice.model_validate(
-        state["extracted_invoice"]
-    )
-
-    invoice_id = save_processed_invoice(
-        invoice=invoice,
-        supplier_id=state["supplier_id"],
-        po_id=state["po_id"],
-        matching_result=state["matching_result"],
-        source_file=state["invoice_path"],
-    )
-
-    return {
-        "invoice_id": invoice_id,
-        "final_status": "matched",
-    }
-
 def risk_node(state: InvoiceState):
     invoice = ExtractedInvoice.model_validate(
         state["extracted_invoice"]
@@ -288,6 +272,154 @@ def risk_review_node(state: InvoiceState):
         "final_status": "risk_review",
     }
 
+
+def approval_node(state: InvoiceState):
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
+    )
+
+    result = determine_approval(
+        invoice=invoice,
+        risk_result=state["risk_result"],
+    )
+
+    return {
+        "approval_required": result["approval_required"],
+        "approval_result": result,
+    }
+
+
+def approval_router(state: InvoiceState):
+    status = state["approval_result"]["approval_status"]
+
+    if status == "approved":
+        return "approved"
+
+    if status == "pending":
+        return "human"
+
+    return "blocked"
+
+
+def human_approval_node(state: InvoiceState):
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
+    )
+
+    approval = get_or_create_pending_approval(
+        invoice_id=state["invoice_id"]
+    )
+
+    interrupt_payload = {
+        "type": "invoice_approval",
+        "approval_id": approval["approval_id"],
+        "invoice_id": state["invoice_id"],
+        "invoice_number": invoice.invoice_number,
+        "supplier_id": state["supplier_id"],
+        "po_id": state["po_id"],
+        "total_amount": str(invoice.total_amount),
+        "currency": invoice.currency,
+        "risk_level": state["risk_result"]["risk_level"],
+        "risk_score": state["risk_result"]["risk_score"],
+        "risk_signals": state["risk_result"]["signals"],
+        "reason": state["approval_result"]["reason"],
+        "message": "Human approval is required before this invoice can be persisted.",
+    }
+
+    decision = interrupt(interrupt_payload)
+
+    if not isinstance(decision, dict):
+        raise ValueError(
+            "Approval response must be a dictionary."
+        )
+
+    approved = decision.get("approved")
+
+    if not isinstance(approved, bool):
+        raise ValueError(
+            "Approval response must contain a boolean 'approved' field."
+        )
+
+    reviewer = decision.get("reviewer", "human_reviewer")
+    reviewer_comment = decision.get("comment")
+
+    approval_result = update_invoice_approval(
+        approval_id=approval["approval_id"],
+        approved=approved,
+        reviewer=reviewer,
+        reviewer_comment=reviewer_comment,
+    )
+
+    return {
+        "approval_id": approval["approval_id"],
+        "approval_result": {
+            **state["approval_result"],
+            **approval_result,
+            "decision": "approved" if approved else "rejected",
+        },
+    }
+
+
+def human_approval_router(state: InvoiceState):
+    if state["approval_result"]["approval_status"] == "approved":
+        return "approved"
+
+    return "rejected"
+
+
+def rejection_node(state: InvoiceState):
+    return {
+        "exception_result": {
+            "status": "closed",
+            "reason": (
+                state["approval_result"]
+                .get("reviewer_comment")
+                or "Invoice rejected during human approval."
+            ),
+        },
+        "final_status": "rejected",
+    }
+
+
+def persist_node(state: InvoiceState):
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
+    )
+
+    invoice_id = save_processed_invoice(
+        invoice_id=state["invoice_id"],
+        invoice=invoice,
+        supplier_id=state["supplier_id"],
+        po_id=state["po_id"],
+        matching_result=state["matching_result"],
+        source_file=state["invoice_path"],
+    )
+
+    return {
+        "invoice_id": invoice_id,
+        "final_status": "matched",
+    }
+
+
+def exception_node(state: InvoiceState):
+    reason = (
+        state.get("error")
+        or state.get("matching_result", {}).get("exceptions")
+        or state.get("duplicate_result", {})
+        .get("exact", {})
+        .get("reason")
+        or state.get("validation_result", {}).get("errors")
+    )
+
+    return {
+        "exception_result": {
+            "status": "open",
+            "reason": reason,
+        },
+        "final_status": "exception",
+    }
+
+
 builder = StateGraph(InvoiceState)
 
 builder.add_node("extract", extract_node)
@@ -297,13 +429,15 @@ builder.add_node("duplicate", duplicate_node)
 builder.add_node("duplicate_review", duplicate_review_node)
 builder.add_node("po_retrieval", po_retrieval_node)
 builder.add_node("matching", matching_node)
-builder.add_node("exception", exception_node)
 builder.add_node("risk", risk_node)
 builder.add_node("risk_review", risk_review_node)
+builder.add_node("approval", approval_node)
+builder.add_node("human_approval", human_approval_node)
+builder.add_node("rejection", rejection_node)
 builder.add_node("persist", persist_node)
+builder.add_node("exception", exception_node)
 
 builder.add_edge(START, "extract")
-
 builder.add_edge("extract", "validation")
 
 builder.add_conditional_edges(
@@ -356,16 +490,48 @@ builder.add_conditional_edges(
     "risk",
     risk_router,
     {
-        "clear": "persist",
+        "clear": "approval",
         "review": "risk_review",
     },
 )
 
-builder.add_edge("risk_review", END)
-builder.add_edge("persist", END)
+builder.add_conditional_edges(
+    "approval",
+    approval_router,
+    {
+        "approved": "persist",
+        "human": "human_approval",
+        "blocked": "risk_review",
+    },
+)
+
+builder.add_conditional_edges(
+    "human_approval",
+    human_approval_router,
+    {
+        "approved": "persist",
+        "rejected": "rejection",
+    },
+)
 
 builder.add_edge("duplicate_review", END)
-builder.add_edge("matched", END)
+builder.add_edge("risk_review", END)
+builder.add_edge("rejection", END)
+builder.add_edge("persist", END)
 builder.add_edge("exception", END)
 
-graph = builder.compile()
+
+pool = ConnectionPool(
+    DATABASE_URL,
+    max_size=10,
+    kwargs={
+        "autocommit": True,
+    },
+)
+
+checkpointer = PostgresSaver(pool)
+checkpointer.setup()
+
+graph = builder.compile(
+    checkpointer=checkpointer
+)

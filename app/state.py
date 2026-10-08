@@ -22,10 +22,11 @@ class InvoiceState(TypedDict, total=False):
 
     risk_result: dict
 
-    exception_result: dict
-
     approval_required: bool
     approval_result: dict | None
+    approval_id: int | None
+
+    exception_result: dict
 
     bookkeeping_result: dict | None
     payment_result: dict | None

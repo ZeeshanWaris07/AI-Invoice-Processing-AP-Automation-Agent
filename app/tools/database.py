@@ -216,13 +216,13 @@ import uuid
 
 
 def save_processed_invoice(
+    invoice_id : str,
     invoice,
     supplier_id: str,
     po_id: str,
     matching_result: dict,
     source_file: str | None = None,
 ):
-    invoice_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
 
     line_results = {
         result["invoice_line"]: result
@@ -315,3 +315,108 @@ def save_processed_invoice(
                 )
 
     return invoice_id
+
+
+
+def get_or_create_pending_approval(invoice_id: str):
+    query = """
+        SELECT
+            approval_id,
+            invoice_id,
+            approval_status,
+            requested_at
+        FROM invoice_approvals
+        WHERE invoice_id = %s
+          AND approval_status = 'pending'
+        ORDER BY requested_at DESC
+        LIMIT 1
+    """
+
+    insert_query = """
+        INSERT INTO invoice_approvals (
+            invoice_id,
+            approval_status
+        )
+        VALUES (%s, 'pending')
+        RETURNING
+            approval_id,
+            invoice_id,
+            approval_status,
+            requested_at
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (invoice_id,))
+            row = cur.fetchone()
+
+            if row:
+                return {
+                    "approval_id": row[0],
+                    "invoice_id": row[1],
+                    "approval_status": row[2],
+                    "requested_at": row[3],
+                }
+
+            cur.execute(insert_query, (invoice_id,))
+            row = cur.fetchone()
+
+    return {
+        "approval_id": row[0],
+        "invoice_id": row[1],
+        "approval_status": row[2],
+        "requested_at": row[3],
+    }
+
+
+def update_invoice_approval(
+    approval_id: int,
+    approved: bool,
+    reviewer: str,
+    reviewer_comment: str | None = None,
+):
+    approval_status = "approved" if approved else "rejected"
+
+    query = """
+        UPDATE invoice_approvals
+        SET
+            approval_status = %s,
+            reviewed_at = CURRENT_TIMESTAMP,
+            reviewer = %s,
+            reviewer_comment = %s
+        WHERE approval_id = %s
+        RETURNING
+            approval_id,
+            invoice_id,
+            approval_status,
+            reviewed_at,
+            reviewer,
+            reviewer_comment
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                query,
+                (
+                    approval_status,
+                    reviewer,
+                    reviewer_comment,
+                    approval_id,
+                ),
+            )
+            row = cur.fetchone()
+
+    if not row:
+        raise ValueError(
+            f"Approval record {approval_id} was not found."
+        )
+
+    return {
+        "approval_id": row[0],
+        "invoice_id": row[1],
+        "approval_status": row[2],
+        "reviewed_at": row[3],
+        "reviewer": row[4],
+        "reviewer_comment": row[5],
+    }
