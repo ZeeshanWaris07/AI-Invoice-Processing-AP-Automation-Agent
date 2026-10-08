@@ -2,7 +2,7 @@ from app.graph.workflow import graph
 
 
 result = graph.invoke({
-    "invoice_path": "invoices/invoice_001.pdf"
+    "invoice_path": "invoices/invoice_002.pdf"
 })
 
 
