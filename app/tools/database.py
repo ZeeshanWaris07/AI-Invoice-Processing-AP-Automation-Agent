@@ -211,3 +211,107 @@ def find_supplier_by_name(supplier_name: str):
         "supplier_name": row[1],
         "approved": row[2],
     }
+
+import uuid
+
+
+def save_processed_invoice(
+    invoice,
+    supplier_id: str,
+    po_id: str,
+    matching_result: dict,
+    source_file: str | None = None,
+):
+    invoice_id = f"INV-{uuid.uuid4().hex[:12].upper()}"
+
+    line_results = {
+        result["invoice_line"]: result
+        for result in matching_result["line_results"]
+    }
+
+    invoice_query = """
+        INSERT INTO invoices (
+            invoice_id,
+            supplier_id,
+            po_id,
+            invoice_number,
+            invoice_date,
+            due_date,
+            subtotal,
+            tax_amount,
+            total_amount,
+            currency,
+            status,
+            source_file
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s
+        )
+        RETURNING invoice_id
+    """
+
+    item_query = """
+        INSERT INTO invoice_items (
+            invoice_id,
+            po_item_id,
+            line_no,
+            item_name,
+            unit,
+            quantity,
+            unit_price,
+            tax_amount,
+            line_total
+        )
+        VALUES (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s
+        )
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                invoice_query,
+                (
+                    invoice_id,
+                    supplier_id,
+                    po_id,
+                    invoice.invoice_number,
+                    invoice.invoice_date,
+                    invoice.due_date,
+                    invoice.subtotal,
+                    invoice.tax_amount,
+                    invoice.total_amount,
+                    invoice.currency,
+                    "matched",
+                    source_file,
+                ),
+            )
+
+            invoice_id = cur.fetchone()[0]
+
+            for item in invoice.items:
+                match_result = line_results.get(item.line_no)
+
+                po_item_id = None
+
+                if match_result:
+                    po_item_id = match_result.get("po_item_id")
+
+                cur.execute(
+                    item_query,
+                    (
+                        invoice_id,
+                        po_item_id,
+                        item.line_no,
+                        item.item_name,
+                        item.unit,
+                        item.quantity,
+                        item.unit_price,
+                        item.tax_amount,
+                        item.line_total,
+                    ),
+                )
+
+    return invoice_id

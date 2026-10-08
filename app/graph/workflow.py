@@ -1,14 +1,15 @@
 from langgraph.graph import StateGraph, START, END
 
 from app.state import InvoiceState
-from app.agents.extractor import extract_invoice
-from app.agents.extractor import ExtractedInvoice
+from app.agents.extractor import extract_invoice, ExtractedInvoice
 from app.services.validation import validate_invoice
 from app.services.retrieval import get_po_context
 from app.services.matching import match_invoice
-from app.services.duplicate import check_exact_duplicate
-from app.tools.database import find_supplier_by_name
-
+from app.services.duplicate import (
+    check_exact_duplicate,
+    check_possible_duplicate,
+)
+from app.tools.database import find_supplier_by_name, save_processed_invoice
 
 def extract_node(state: InvoiceState):
     invoice = extract_invoice(state["invoice_path"])
@@ -76,23 +77,81 @@ def supplier_router(state: InvoiceState):
 
 
 def duplicate_node(state: InvoiceState):
-    invoice = state["extracted_invoice"]
-
-    result = check_exact_duplicate(
-        supplier_id=state["supplier_id"],
-        invoice_number=invoice["invoice_number"],
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
     )
 
+    exact_result = check_exact_duplicate(
+        supplier_id=state["supplier_id"],
+        invoice_number=invoice.invoice_number,
+    )
+
+    if exact_result["is_duplicate"]:
+        return {
+            "duplicate_result": {
+                "status": "exact_duplicate",
+                "exact": exact_result,
+                "possible": None,
+                "requires_review": False,
+            }
+        }
+
+    possible_result = check_possible_duplicate(
+        invoice=invoice,
+        supplier_id=state["supplier_id"],
+    )
+
+    if possible_result["is_duplicate"]:
+        return {
+            "duplicate_result": {
+                "status": "likely_duplicate",
+                "exact": exact_result,
+                "possible": possible_result,
+                "requires_review": True,
+            }
+        }
+
+    if possible_result["requires_review"]:
+        return {
+            "duplicate_result": {
+                "status": "possible_duplicate",
+                "exact": exact_result,
+                "possible": possible_result,
+                "requires_review": True,
+            }
+        }
+
     return {
-        "duplicate_result": result
+        "duplicate_result": {
+            "status": "clear",
+            "exact": exact_result,
+            "possible": possible_result,
+            "requires_review": False,
+        }
     }
 
 
 def duplicate_router(state: InvoiceState):
-    if state["duplicate_result"]["is_duplicate"]:
-        return "duplicate"
+    status = state["duplicate_result"]["status"]
 
-    return "new"
+    if status == "exact_duplicate":
+        return "exact_duplicate"
+
+    if status in {"likely_duplicate", "possible_duplicate"}:
+        return "review"
+
+    return "clear"
+
+
+def duplicate_review_node(state: InvoiceState):
+    return {
+        "exception_result": {
+            "status": "open",
+            "reason": "Potential duplicate invoice requires manual review.",
+            "duplicate_result": state["duplicate_result"],
+        },
+        "final_status": "duplicate_review",
+    }
 
 
 def po_retrieval_node(state: InvoiceState):
@@ -162,7 +221,9 @@ def exception_node(state: InvoiceState):
     reason = (
         state.get("error")
         or state.get("matching_result", {}).get("exceptions")
-        or state.get("duplicate_result", {}).get("reason")
+        or state.get("duplicate_result", {})
+        .get("exact", {})
+        .get("reason")
         or state.get("validation_result", {}).get("errors")
     )
 
@@ -176,10 +237,22 @@ def exception_node(state: InvoiceState):
 
 
 def matched_node(state: InvoiceState):
-    return {
-        "final_status": "matched"
-    }
+    invoice = ExtractedInvoice.model_validate(
+        state["extracted_invoice"]
+    )
 
+    invoice_id = save_processed_invoice(
+        invoice=invoice,
+        supplier_id=state["supplier_id"],
+        po_id=state["po_id"],
+        matching_result=state["matching_result"],
+        source_file=state["invoice_path"],
+    )
+
+    return {
+        "invoice_id": invoice_id,
+        "final_status": "matched",
+    }
 
 builder = StateGraph(InvoiceState)
 
@@ -187,6 +260,7 @@ builder.add_node("extract", extract_node)
 builder.add_node("validation", validation_node)
 builder.add_node("supplier", supplier_node)
 builder.add_node("duplicate", duplicate_node)
+builder.add_node("duplicate_review", duplicate_review_node)
 builder.add_node("po_retrieval", po_retrieval_node)
 builder.add_node("matching", matching_node)
 builder.add_node("exception", exception_node)
@@ -218,8 +292,9 @@ builder.add_conditional_edges(
     "duplicate",
     duplicate_router,
     {
-        "new": "po_retrieval",
-        "duplicate": "exception",
+        "exact_duplicate": "exception",
+        "review": "duplicate_review",
+        "clear": "po_retrieval",
     },
 )
 
@@ -241,6 +316,7 @@ builder.add_conditional_edges(
     },
 )
 
+builder.add_edge("duplicate_review", END)
 builder.add_edge("matched", END)
 builder.add_edge("exception", END)
 
